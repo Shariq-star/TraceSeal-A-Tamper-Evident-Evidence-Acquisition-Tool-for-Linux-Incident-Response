@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 """
-TraceSeal v0.1 (Week 2): evidence collector for Linux.
+TraceSeal v0.2 (Week 3): evidence collector with a tamper-evident custody log.
 
-What it does (in this order, following the order of volatility):
-  1. Runs volatile-data commands (time, network, processes, users)
-  2. Runs log commands (journalctl, dmesg)
-  3. Copies a small list of files, hashing each file before and after the copy
-  4. Writes manifest.json with a SHA-256 hash and UTC timestamp for every artifact
+collect : gathers evidence in order of volatility (volatile data, logs, files),
+          writes manifest.json and a hash-chained custody_log.jsonl
+verify  : re-checks a case folder and reports modified, missing or added
+          evidence, a broken custody log, or a modified manifest
+
+Every custody log entry stores the hash of the previous entry, so changing,
+removing or reordering an entry breaks the chain. The last entry (CASE_END)
+seals the SHA-256 of manifest.json.
+
+Optional hardening:
+  --key-file    chain hashes become HMAC-SHA256, so the chain cannot be
+                recomputed without the key
+  --expect-head verify compares the chain head with a value you stored
+                somewhere else (for example in an email)
 
 Use only on systems you own or are authorized to examine.
-Usage:  sudo python3 traceseal.py collect --case-id CASE001 --output ./cases
+
+  sudo python3 traceseal.py collect --case-id CASE001 --output ./cases
+  python3 traceseal.py verify --case ./cases/CASE001_<timestamp>
 """
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
+import platform
 import pwd
 import shutil
 import socket
@@ -23,22 +36,26 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-VERSION = "0.1"
+VERSION = "0.2"
+GENESIS_HASH = "0" * 64
+LOG_NAME = "custody_log.jsonl"
+MANIFEST_NAME = "manifest.json"
 
 # (name, command). Order matters: most volatile first.
 VOLATILE_COMMANDS = [
-    ("date_utc",      ["date", "-u"]),
-    ("uptime",        ["uptime"]),
-    ("uname",         ["uname", "-a"]),
-    ("arp_neighbors", ["ip", "neigh"]),
-    ("ip_addr",       ["ip", "addr"]),
-    ("ip_route",      ["ip", "route"]),
-    ("sockets",       ["ss", "-tulpan"]),
-    ("processes",     ["ps", "-eo", "pid,ppid,user,lstart,cmd"]),
-    ("who",           ["who"]),
-    ("w",             ["w"]),
-    ("last_logins",   ["last", "-n", "50"]),
-    ("mounts",        ["mount"]),
+    ("date_utc",       ["date", "-u"]),
+    ("uptime",         ["uptime"]),
+    ("uname",          ["uname", "-a"]),
+    ("arp_neighbors",  ["ip", "neigh"]),
+    ("ip_addr",        ["ip", "addr"]),
+    ("ip_route",       ["ip", "route"]),
+    ("sockets",        ["ss", "-tulpan"]),
+    ("processes",      ["ps", "-eo", "pid,ppid,user,lstart,cmd"]),
+    ("who",            ["who"]),
+    ("w",              ["w"]),
+    ("login_sessions", ["loginctl", "list-sessions", "--no-pager"]),
+    ("last_logins",    ["last", "-n", "50"]),
+    ("mounts",         ["mount"]),
     ("kernel_modules", ["lsmod"]),
 ]
 
@@ -47,15 +64,16 @@ LOG_COMMANDS = [
     ("dmesg",            ["dmesg"]),
 ]
 
-# Files to copy. Missing files are recorded as "skipped", not as errors.
-FILES_TO_COLLECT = [
+SYSTEM_FILES = [
     "/etc/passwd",
     "/etc/hosts",
     "/etc/crontab",
     "/etc/os-release",
-    "/var/log/auth.log",   # may not exist on newer Kali (uses journald)
+    "/var/log/auth.log",   # not present on systems that only use journald
 ]
 
+
+# ---------------------------------------------------------------- helpers
 
 def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -82,7 +100,81 @@ def real_user_home():
         return os.path.expanduser("~")
 
 
-def collect_commands(commands, kind, case_dir, subdir, artifacts):
+def files_to_collect():
+    home = real_user_home()
+    return SYSTEM_FILES + [
+        os.path.join(home, ".bash_history"),
+        os.path.join(home, ".zsh_history"),
+    ]
+
+
+def load_key(path):
+    if not path:
+        return None
+    with open(path, "rb") as f:
+        key = f.read().strip()
+    if not key:
+        sys.exit("error: key file is empty")
+    return key
+
+
+# ------------------------------------------------------- custody log chain
+
+def canonical(obj):
+    """Stable JSON bytes, so the same entry always produces the same hash."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def chain_hash(entry_without_hash, key=None):
+    data = canonical(entry_without_hash)
+    if key:
+        return hmac.new(key, data, hashlib.sha256).hexdigest()
+    return hashlib.sha256(data).hexdigest()
+
+
+def actor_info():
+    return {
+        "user": pwd.getpwuid(os.geteuid()).pw_name,
+        "sudo_user": os.environ.get("SUDO_USER"),
+        "uid": os.geteuid(),
+        "hostname": socket.gethostname(),
+    }
+
+
+class CustodyLog:
+    """Append-only log. Each entry contains the hash of the previous entry."""
+
+    def __init__(self, path, key=None):
+        self.path = path
+        self.key = key
+        self.seq = 0
+        self.prev_hash = GENESIS_HASH
+        self.actor = actor_info()
+
+    def append(self, event, details):
+        entry = {
+            "seq": self.seq,
+            "timestamp_utc": utc_now(),
+            "event": event,
+            "actor": self.actor,
+            "details": details,
+            "prev_hash": self.prev_hash,
+        }
+        entry["entry_hash"] = chain_hash(entry, self.key)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, sort_keys=True) + "\n")
+        self.prev_hash = entry["entry_hash"]
+        self.seq += 1
+
+
+def log_artifact(log, entry):
+    keys = ("id", "type", "source", "status", "file", "sha256", "reason")
+    log.append("ARTIFACT", {k: entry.get(k) for k in keys})
+
+
+# -------------------------------------------------------------- collection
+
+def collect_commands(commands, kind, case_dir, subdir, artifacts, log):
     out_dir = os.path.join(case_dir, subdir)
     os.makedirs(out_dir, exist_ok=True)
     for name, cmd in commands:
@@ -112,10 +204,11 @@ def collect_commands(commands, kind, case_dir, subdir, artifacts):
         except subprocess.TimeoutExpired:
             entry.update({"status": "skipped", "reason": "timeout (30s)"})
         artifacts.append(entry)
+        log_artifact(log, entry)
         print(f"  [{entry['status']:9}] {entry['source']}")
 
 
-def collect_files(paths, case_dir, artifacts):
+def collect_files(paths, case_dir, artifacts, log):
     for src in paths:
         entry = {
             "id": len(artifacts) + 1,
@@ -143,63 +236,230 @@ def collect_files(paths, case_dir, artifacts):
         except PermissionError:
             entry.update({"status": "skipped", "reason": "permission denied"})
         artifacts.append(entry)
+        log_artifact(log, entry)
         print(f"  [{entry['status']:9}] {src}")
 
 
-def run_collect(case_id, output):
+def run_collect(case_id, output, key_file):
     if os.geteuid() != 0:
         print("WARNING: not running as root. Some data will be incomplete or skipped.\n")
 
+    key = load_key(key_file)
     started = utc_now()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     case_dir = os.path.join(output, f"{case_id}_{stamp}")
     os.makedirs(case_dir, exist_ok=False)  # never overwrite an old case
 
+    log = CustodyLog(os.path.join(case_dir, LOG_NAME), key)
+    log.append("CASE_START", {
+        "case_id": case_id,
+        "tool_version": VERSION,
+        "tool_pid": os.getpid(),
+        "keyed": bool(key),
+        "platform": platform.platform(),
+    })
+
     artifacts = []
-
     print("[1/3] Volatile data")
-    collect_commands(VOLATILE_COMMANDS, "volatile", case_dir, "volatile", artifacts)
-
+    collect_commands(VOLATILE_COMMANDS, "volatile", case_dir, "volatile", artifacts, log)
     print("[2/3] Logs")
-    collect_commands(LOG_COMMANDS, "log", case_dir, "logs", artifacts)
-
+    collect_commands(LOG_COMMANDS, "log", case_dir, "logs", artifacts, log)
     print("[3/3] Files")
-    files = FILES_TO_COLLECT + [os.path.join(real_user_home(), ".bash_history")]
-    collect_files(files, case_dir, artifacts)
+    collect_files(files_to_collect(), case_dir, artifacts, log)
 
     manifest = {
         "tool": "TraceSeal",
         "version": VERSION,
         "case_id": case_id,
         "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+        "tool_pid": os.getpid(),
         "collected_by_uid": os.getuid(),
         "started_utc": started,
         "finished_utc": utc_now(),
         "artifacts": artifacts,
     }
-    manifest_path = os.path.join(case_dir, "manifest.json")
+    manifest_path = os.path.join(case_dir, MANIFEST_NAME)
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
+    manifest_sha = sha256_file(manifest_path)
     collected = sum(1 for a in artifacts if a["status"] == "collected")
+    log.append("CASE_END", {
+        "manifest_sha256": manifest_sha,
+        "artifact_count": len(artifacts),
+        "collected_count": collected,
+    })
+
     print(f"\nDone. {collected}/{len(artifacts)} artifacts collected.")
     print(f"Case folder : {case_dir}")
-    print(f"Manifest    : {manifest_path}")
-    print(f"Manifest SHA-256: {sha256_file(manifest_path)}")
+    print(f"Manifest SHA-256 : {manifest_sha}")
+    print(f"Custody log      : {log.seq} entries" + (" (HMAC keyed)" if key else ""))
+    print(f"Chain head       : {log.prev_hash}")
+    print("Store the chain head somewhere separate (for example in an email)."
+          " verify --expect-head can check it later.")
+    return 0
 
+
+# ------------------------------------------------------------ verification
+
+def verify_case(case_dir, key=None, expect_head=None):
+    """Return (findings, chain_head, stats). findings is a list of (code, message)."""
+    findings = []
+
+    def bad(code, msg):
+        findings.append((code, msg))
+
+    stats = {"log_entries": 0, "artifacts_checked": 0}
+    manifest_path = os.path.join(case_dir, MANIFEST_NAME)
+    log_path = os.path.join(case_dir, LOG_NAME)
+
+    # load manifest
+    manifest = None
+    if not os.path.isfile(manifest_path):
+        bad("MANIFEST_MISSING", "manifest.json is missing")
+    else:
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except ValueError as e:
+            bad("MANIFEST_UNREADABLE", f"manifest.json cannot be read ({e})")
+
+    # load custody log
+    entries = []
+    if not os.path.isfile(log_path):
+        bad("LOG_MISSING", f"{LOG_NAME} is missing")
+    else:
+        with open(log_path, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except ValueError:
+                    bad("LOG_UNREADABLE", f"log line {n} is not valid JSON")
+        if not entries:
+            bad("LOG_EMPTY", "custody log has no entries")
+    stats["log_entries"] = len(entries)
+
+    # check the hash chain
+    head = None
+    if entries:
+        start_details = entries[0].get("details") if isinstance(entries[0].get("details"), dict) else {}
+        if start_details.get("keyed") and not key:
+            bad("KEY_REQUIRED", "this log is HMAC keyed; supply --key-file to verify the chain")
+        else:
+            prev = GENESIS_HASH
+            for i, e in enumerate(entries):
+                if e.get("seq") != i:
+                    bad("CHAIN_BREAK", f"entry {i}: sequence number is {e.get('seq')}, expected {i} "
+                                       "(an entry was removed or reordered)")
+                    break
+                if e.get("prev_hash") != prev:
+                    bad("CHAIN_BREAK", f"entry {i}: prev_hash does not match the previous entry")
+                    break
+                body = {k: v for k, v in e.items() if k != "entry_hash"}
+                if chain_hash(body, key) != e.get("entry_hash"):
+                    bad("CHAIN_BREAK", f"entry {i}: content was changed (entry hash mismatch)")
+                    break
+                prev = e["entry_hash"]
+            else:
+                head = prev
+
+        if entries[-1].get("event") != "CASE_END":
+            bad("LOG_INCOMPLETE", "log does not end with CASE_END (truncated or interrupted)")
+
+    # compare chain head with an externally stored value
+    if expect_head and head is not None and head != expect_head:
+        bad("HEAD_MISMATCH", "chain head differs from the value you stored separately")
+
+    # manifest seal
+    case_end = entries[-1] if entries and entries[-1].get("event") == "CASE_END" else None
+    if case_end and os.path.isfile(manifest_path):
+        sealed = (case_end.get("details") or {}).get("manifest_sha256")
+        if sealed != sha256_file(manifest_path):
+            bad("MANIFEST_MODIFIED", "manifest.json does not match the hash sealed in the custody log")
+
+    # artifacts
+    if manifest:
+        log_artifacts = {}
+        for e in entries:
+            if e.get("event") == "ARTIFACT" and isinstance(e.get("details"), dict):
+                log_artifacts[e["details"].get("id")] = e["details"]
+
+        listed = set()
+        for a in manifest.get("artifacts", []):
+            if a.get("status") != "collected":
+                continue
+            stats["artifacts_checked"] += 1
+            rel = a.get("file", "")
+            listed.add(os.path.normpath(rel))
+            full = os.path.join(case_dir, rel)
+            if not os.path.isfile(full):
+                bad("FILE_MISSING", f"artifact {a.get('id')}: {rel} is missing")
+            elif sha256_file(full) != a.get("sha256"):
+                bad("FILE_MODIFIED", f"artifact {a.get('id')}: {rel} does not match its recorded SHA-256")
+            la = log_artifacts.get(a.get("id"))
+            if la is None:
+                bad("LOG_MISMATCH", f"artifact {a.get('id')}: no matching custody log entry")
+            elif la.get("sha256") != a.get("sha256"):
+                bad("LOG_MISMATCH", f"artifact {a.get('id')}: hash differs between manifest and custody log")
+
+        allowed = listed | {MANIFEST_NAME, LOG_NAME}
+        for root, _, files in os.walk(case_dir):
+            for fn in files:
+                rel = os.path.normpath(os.path.relpath(os.path.join(root, fn), case_dir))
+                if rel not in allowed:
+                    bad("FILE_ADDED", f"{rel} is in the case folder but not in the manifest")
+
+    return findings, head, stats
+
+
+def run_verify(case_dir, key_file, expect_head):
+    if not os.path.isdir(case_dir):
+        print(f"error: case folder not found: {case_dir}")
+        return 2
+    key = load_key(key_file)
+    findings, head, stats = verify_case(case_dir, key, expect_head)
+
+    print(f"Verifying {case_dir}")
+    print(f"  custody log entries : {stats['log_entries']}")
+    print(f"  artifacts checked   : {stats['artifacts_checked']}")
+    if head:
+        print(f"  chain head          : {head}")
+    print()
+    for code, msg in findings:
+        print(f"  [FAIL] {code}: {msg}")
+    if findings:
+        print(f"\nRESULT: FAIL ({len(findings)} finding(s))")
+        return 1
+    print("RESULT: PASS (no tampering detected)")
+    return 0
+
+
+# --------------------------------------------------------------------- CLI
 
 def main():
-    parser = argparse.ArgumentParser(prog="traceseal", description="TraceSeal evidence collector")
+    parser = argparse.ArgumentParser(prog="traceseal", description="TraceSeal evidence collector and verifier")
     sub = parser.add_subparsers(dest="command", required=True)
+
     c = sub.add_parser("collect", help="collect evidence from this host")
     c.add_argument("--case-id", required=True, help="case identifier, e.g. CASE001")
     c.add_argument("--output", default="./cases", help="folder where case folders are created")
-    args = parser.parse_args()
+    c.add_argument("--key-file", help="secret key file; makes the custody chain HMAC keyed")
 
+    v = sub.add_parser("verify", help="verify a collected case folder")
+    v.add_argument("--case", required=True, help="path to a case folder")
+    v.add_argument("--key-file", help="key file used at collection time (if the case was keyed)")
+    v.add_argument("--expect-head", help="chain head hash you stored separately")
+
+    args = parser.parse_args()
     if args.command == "collect":
-        run_collect(args.case_id, args.output)
+        return run_collect(args.case_id, args.output, args.key_file)
+    return run_verify(args.case, args.key_file, args.expect_head)
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
