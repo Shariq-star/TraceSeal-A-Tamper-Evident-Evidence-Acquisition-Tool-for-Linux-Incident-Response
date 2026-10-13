@@ -91,6 +91,14 @@ def sha256_file(path, chunk_size=65536):
     return h.hexdigest()
 
 
+def safe_sha256(path):
+    """Return (hash, None), or (None, error text) if the file cannot be read."""
+    try:
+        return sha256_file(path), None
+    except OSError as e:
+        return None, e.strerror or str(e)
+
+
 def real_user_home():
     """Home directory of the user who ran sudo (not root's)."""
     name = os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
@@ -323,7 +331,7 @@ def verify_case(case_dir, key=None, expect_head=None):
         try:
             with open(manifest_path, encoding="utf-8") as f:
                 manifest = json.load(f)
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             bad("MANIFEST_UNREADABLE", f"manifest.json cannot be read ({e})")
 
     # load custody log
@@ -331,17 +339,20 @@ def verify_case(case_dir, key=None, expect_head=None):
     if not os.path.isfile(log_path):
         bad("LOG_MISSING", f"{LOG_NAME} is missing")
     else:
-        with open(log_path, encoding="utf-8") as f:
-            for n, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except ValueError:
-                    bad("LOG_UNREADABLE", f"log line {n} is not valid JSON")
-        if not entries:
-            bad("LOG_EMPTY", "custody log has no entries")
+        try:
+            with open(log_path, encoding="utf-8") as f:
+                for n, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except ValueError:
+                        bad("LOG_UNREADABLE", f"log line {n} is not valid JSON")
+            if not entries:
+                bad("LOG_EMPTY", "custody log has no entries")
+        except OSError as e:
+            bad("LOG_UNREADABLE", f"{LOG_NAME} cannot be read ({e.strerror}); try running verify with sudo")
     stats["log_entries"] = len(entries)
 
     # check the hash chain
@@ -379,7 +390,10 @@ def verify_case(case_dir, key=None, expect_head=None):
     case_end = entries[-1] if entries and entries[-1].get("event") == "CASE_END" else None
     if case_end and os.path.isfile(manifest_path):
         sealed = (case_end.get("details") or {}).get("manifest_sha256")
-        if sealed != sha256_file(manifest_path):
+        actual, err = safe_sha256(manifest_path)
+        if err:
+            bad("MANIFEST_UNREADABLE", f"manifest.json cannot be hashed ({err}); try running verify with sudo")
+        elif sealed != actual:
             bad("MANIFEST_MODIFIED", "manifest.json does not match the hash sealed in the custody log")
 
     # artifacts
@@ -397,10 +411,16 @@ def verify_case(case_dir, key=None, expect_head=None):
             rel = a.get("file", "")
             listed.add(os.path.normpath(rel))
             full = os.path.join(case_dir, rel)
-            if not os.path.isfile(full):
+            try:
+                actual = sha256_file(full)
+            except FileNotFoundError:
                 bad("FILE_MISSING", f"artifact {a.get('id')}: {rel} is missing")
-            elif sha256_file(full) != a.get("sha256"):
-                bad("FILE_MODIFIED", f"artifact {a.get('id')}: {rel} does not match its recorded SHA-256")
+            except OSError as e:
+                bad("FILE_UNREADABLE", f"artifact {a.get('id')}: {rel} cannot be read ({e.strerror}); "
+                                       "try running verify with sudo")
+            else:
+                if actual != a.get("sha256"):
+                    bad("FILE_MODIFIED", f"artifact {a.get('id')}: {rel} does not match its recorded SHA-256")
             la = log_artifacts.get(a.get("id"))
             if la is None:
                 bad("LOG_MISMATCH", f"artifact {a.get('id')}: no matching custody log entry")
@@ -432,6 +452,8 @@ def run_verify(case_dir, key_file, expect_head):
     print()
     for code, msg in findings:
         print(f"  [FAIL] {code}: {msg}")
+    if any(code.endswith("UNREADABLE") for code, _ in findings):
+        print("\nHint: evidence collected with sudo is owned by root. Run verify with sudo too.")
     if findings:
         print(f"\nRESULT: FAIL ({len(findings)} finding(s))")
         return 1
