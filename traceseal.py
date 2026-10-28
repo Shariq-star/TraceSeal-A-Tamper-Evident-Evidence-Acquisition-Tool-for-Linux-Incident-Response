@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TraceSeal v0.2 (Week 3): evidence collector with a tamper-evident custody log.
+TraceSeal v0.3 (Week 4): evidence collector with a tamper-evident custody log.
 
 collect : gathers evidence in order of volatility (volatile data, logs, files),
           writes manifest.json and a hash-chained custody_log.jsonl
@@ -11,9 +11,14 @@ Every custody log entry stores the hash of the previous entry, so changing,
 removing or reordering an entry breaks the chain. The last entry (CASE_END)
 seals the SHA-256 of manifest.json.
 
+keygen  : creates a random secret key file (mode 600) for --key-file
+
 Optional hardening:
   --key-file    chain hashes become HMAC-SHA256, so the chain cannot be
                 recomputed without the key
+  --preserve-owner  (root only) also gives the collected copies the original
+                owner and group; the original owner, group, mode and times
+                are always recorded in the manifest either way
   --expect-head verify compares the chain head with a value you stored
                 somewhere else (for example in an email)
 
@@ -24,19 +29,21 @@ Use only on systems you own or are authorized to examine.
 """
 
 import argparse
+import grp
 import hashlib
 import hmac
 import json
 import os
 import platform
 import pwd
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
 from datetime import datetime, timezone
 
-VERSION = "0.2"
+VERSION = "0.3"
 GENESIS_HASH = "0" * 64
 LOG_NAME = "custody_log.jsonl"
 MANIFEST_NAME = "manifest.json"
@@ -116,14 +123,65 @@ def files_to_collect():
     ]
 
 
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def source_metadata(path):
+    """Owner, group, mode and times of a source file, read BEFORE the file is opened.
+    os.stat does not change the access time, so the original atime is preserved."""
+    st = os.stat(path)
+    try:
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        owner = None
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = None
+    return {
+        "uid": st.st_uid, "gid": st.st_gid, "owner": owner, "group": group,
+        "mode": format(st.st_mode & 0o7777, "04o"),
+        "atime_utc": _iso(st.st_atime), "mtime_utc": _iso(st.st_mtime), "ctime_utc": _iso(st.st_ctime),
+    }
+
+
 def load_key(path):
+    """Read the secret key. Warns about weak or badly protected key files."""
     if not path:
         return None
-    with open(path, "rb") as f:
-        key = f.read().strip()
+    try:
+        with open(path, "rb") as f:
+            key = f.read().strip()
+        mode = os.stat(path).st_mode
+    except OSError as e:
+        sys.exit(f"error: cannot read key file {path} ({e.strerror})")
     if not key:
         sys.exit("error: key file is empty")
+    if mode & 0o077:
+        print(f"WARNING: key file {path} is readable by other users. Run: chmod 600 {path}",
+              file=sys.stderr)
+    if len(key) < 16:
+        print("WARNING: key is shorter than 16 bytes. Create a strong key with: "
+              "python3 traceseal.py keygen --out <file>", file=sys.stderr)
     return key
+
+
+def run_keygen(out, force):
+    """Create a random 256-bit key, readable only by its owner. Never prints the key."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL)
+    try:
+        fd = os.open(out, flags, 0o600)
+    except FileExistsError:
+        print(f"error: {out} already exists (use --force to overwrite it)")
+        return 1
+    with os.fdopen(fd, "w") as f:
+        f.write(secrets.token_hex(32) + "\n")
+    os.chmod(out, 0o600)
+    print(f"Key written to {out} (256-bit, mode 600).")
+    print("Keep it OUTSIDE the case folder and the repository, and keep a separate backup.")
+    print("Anyone with this key can recompute the custody chain.")
+    return 0
 
 
 # ------------------------------------------------------- custody log chain
@@ -176,7 +234,7 @@ class CustodyLog:
 
 
 def log_artifact(log, entry):
-    keys = ("id", "type", "source", "status", "file", "sha256", "reason")
+    keys = ("id", "type", "source", "status", "file", "sha256", "reason", "source_metadata")
     log.append("ARTIFACT", {k: entry.get(k) for k in keys})
 
 
@@ -209,14 +267,18 @@ def collect_commands(commands, kind, case_dir, subdir, artifacts, log):
                 entry["stderr"] = result.stderr.strip()[:300]
         except FileNotFoundError:
             entry.update({"status": "skipped", "reason": "command not found"})
+        except PermissionError:
+            entry.update({"status": "skipped", "reason": "permission denied: cannot run command"})
         except subprocess.TimeoutExpired:
             entry.update({"status": "skipped", "reason": "timeout (30s)"})
+        except OSError as e:
+            entry.update({"status": "skipped", "reason": f"cannot run command: {e.strerror}"})
         artifacts.append(entry)
         log_artifact(log, entry)
         print(f"  [{entry['status']:9}] {entry['source']}")
 
 
-def collect_files(paths, case_dir, artifacts, log):
+def collect_files(paths, case_dir, artifacts, log, preserve_owner=False):
     for src in paths:
         entry = {
             "id": len(artifacts) + 1,
@@ -225,11 +287,16 @@ def collect_files(paths, case_dir, artifacts, log):
             "collected_utc": utc_now(),
         }
         try:
+            meta = source_metadata(src)          # before any read, so atime is untouched
             hash_before = sha256_file(src)
             rel_path = os.path.join("files", src.lstrip("/"))
             dst = os.path.join(case_dir, rel_path)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)  # copy2 keeps original timestamps
+            shutil.copy2(src, dst)  # copy2 keeps permissions and modification time
+            owner_restored = False
+            if preserve_owner and os.geteuid() == 0:
+                os.chown(dst, meta["uid"], meta["gid"])
+                owner_restored = True
             hash_after = sha256_file(dst)
             entry.update({
                 "status": "collected",
@@ -238,6 +305,8 @@ def collect_files(paths, case_dir, artifacts, log):
                 "sha256": hash_after,
                 "sha256_source_before_copy": hash_before,
                 "copy_verified": hash_before == hash_after,
+                "source_metadata": meta,
+                "owner_restored_on_copy": owner_restored,
             })
         except FileNotFoundError:
             entry.update({"status": "skipped", "reason": "file not found"})
@@ -248,11 +317,19 @@ def collect_files(paths, case_dir, artifacts, log):
         print(f"  [{entry['status']:9}] {src}")
 
 
-def run_collect(case_id, output, key_file):
+def run_collect(case_id, output, key_file, preserve_owner=False):
     if os.geteuid() != 0:
         print("WARNING: not running as root. Some data will be incomplete or skipped.\n")
 
     key = load_key(key_file)
+    if key_file:
+        out_abs = os.path.abspath(output) + os.sep
+        if os.path.abspath(key_file).startswith(out_abs):
+            print("WARNING: the key file is inside the evidence output folder. "
+                  "Keep it somewhere else.", file=sys.stderr)
+    if preserve_owner and os.geteuid() != 0:
+        print("WARNING: --preserve-owner needs root, so the copies will stay owned by you. "
+              "The original owner is still recorded in the manifest.\n")
     started = utc_now()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     case_dir = os.path.join(output, f"{case_id}_{stamp}")
@@ -264,6 +341,8 @@ def run_collect(case_id, output, key_file):
         "tool_version": VERSION,
         "tool_pid": os.getpid(),
         "keyed": bool(key),
+        "preserve_owner": bool(preserve_owner),
+        "run_as_root": os.geteuid() == 0,
         "platform": platform.platform(),
     })
 
@@ -273,7 +352,7 @@ def run_collect(case_id, output, key_file):
     print("[2/3] Logs")
     collect_commands(LOG_COMMANDS, "log", case_dir, "logs", artifacts, log)
     print("[3/3] Files")
-    collect_files(files_to_collect(), case_dir, artifacts, log)
+    collect_files(files_to_collect(), case_dir, artifacts, log, preserve_owner)
 
     manifest = {
         "tool": "TraceSeal",
@@ -284,6 +363,8 @@ def run_collect(case_id, output, key_file):
         "python_version": platform.python_version(),
         "tool_pid": os.getpid(),
         "collected_by_uid": os.getuid(),
+        "run_as_root": os.geteuid() == 0,
+        "preserve_owner": bool(preserve_owner),
         "started_utc": started,
         "finished_utc": utc_now(),
         "artifacts": artifacts,
@@ -300,7 +381,12 @@ def run_collect(case_id, output, key_file):
         "collected_count": collected,
     })
 
+    with_errors = [a["source"] for a in artifacts
+                   if a.get("exit_code") not in (None, 0)]
     print(f"\nDone. {collected}/{len(artifacts)} artifacts collected.")
+    if with_errors:
+        print(f"Note: {len(with_errors)} command(s) exited with an error (output may be incomplete): "
+              + ", ".join(with_errors))
     print(f"Case folder : {case_dir}")
     print(f"Manifest SHA-256 : {manifest_sha}")
     print(f"Custody log      : {log.seq} entries" + (" (HMAC keyed)" if key else ""))
@@ -471,15 +557,23 @@ def main():
     c.add_argument("--case-id", required=True, help="case identifier, e.g. CASE001")
     c.add_argument("--output", default="./cases", help="folder where case folders are created")
     c.add_argument("--key-file", help="secret key file; makes the custody chain HMAC keyed")
+    c.add_argument("--preserve-owner", action="store_true",
+                   help="(root only) give the copies the original owner and group")
 
     v = sub.add_parser("verify", help="verify a collected case folder")
     v.add_argument("--case", required=True, help="path to a case folder")
     v.add_argument("--key-file", help="key file used at collection time (if the case was keyed)")
     v.add_argument("--expect-head", help="chain head hash you stored separately")
 
+    k = sub.add_parser("keygen", help="create a random secret key file for --key-file")
+    k.add_argument("--out", required=True, help="where to write the key (created with mode 600)")
+    k.add_argument("--force", action="store_true", help="overwrite an existing key file")
+
     args = parser.parse_args()
+    if args.command == "keygen":
+        return run_keygen(args.out, args.force)
     if args.command == "collect":
-        return run_collect(args.case_id, args.output, args.key_file)
+        return run_collect(args.case_id, args.output, args.key_file, args.preserve_owner)
     return run_verify(args.case, args.key_file, args.expect_head)
 
 
