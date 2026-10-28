@@ -96,6 +96,22 @@ def t_edit_manifest(case):
         json.dump(m, f, indent=2)
 
 
+def t_edit_owner(case):
+    """Change the recorded original owner of a collected file in the manifest."""
+    path = os.path.join(case, ts.MANIFEST_NAME)
+    m = load_manifest(case)
+    done = False
+    for a in m["artifacts"]:
+        if a.get("source_metadata"):
+            a["source_metadata"]["owner"] = "attacker"
+            done = True
+            break
+    if not done:
+        raise RuntimeError("no file artifact with metadata found")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(m, f, indent=2)
+
+
 def t_forge_chain(case):
     """Attacker edits a file and rewrites manifest, log entries and chain
     consistently, WITHOUT knowing any secret key."""
@@ -139,6 +155,7 @@ def main():
     keyfile = os.path.join(workdir, "test.key")
     with open(keyfile, "wb") as f:
         f.write(b"correct-horse-battery-staple")
+    os.chmod(keyfile, 0o600)
 
     print("Collecting a plain case and a keyed case (a few seconds)...")
     plain = collect_case(workdir, "PLAIN")
@@ -156,6 +173,8 @@ def main():
         ("T6", "Delete a custody log entry", plain, t_delete_log_entry, "CHAIN_BREAK", {}),
         ("T7", "Edit manifest.json", plain, t_edit_manifest, "MANIFEST_MODIFIED", {}),
         ("T8", "Delete the last log entry (CASE_END)", plain, t_truncate_log, "LOG_INCOMPLETE", {}),
+        ("T8b", "Edit the recorded owner of a file in the manifest", plain, t_edit_owner,
+         "MANIFEST_MODIFIED", {}),
         ("T9a", "Forge file + manifest + whole chain (plain chain, no anchor)",
          plain, t_forge_chain, "PASS", {}),
         ("T9b", "Same forgery, verified against the stored chain head",
