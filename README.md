@@ -105,4 +105,4 @@ A plain hash chain cannot stop someone who rewrites every hash (test T9a passes 
 Use this tool only on systems you own or have explicit authorization to examine. All testing for this project was done in personal VM labs.
 
 ## Author
-Shariq | BS Digital Forensics and Cybersecurity, Hamdard University
+Shariq
