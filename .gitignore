@@ -2,3 +2,4 @@ cases/
 __pycache__/
 *.pyc
 *.key
+cases_*/

@@ -10,6 +10,7 @@ TraceSeal tamper tests on kali (Linux-7.0.12+kali-amd64-x86_64-with-glibc2.42)
 | T6 | Delete a custody log entry | CHAIN_BREAK | CHAIN_BREAK, LOG_MISMATCH | OK |
 | T7 | Edit manifest.json | MANIFEST_MODIFIED | MANIFEST_MODIFIED | OK |
 | T8 | Delete the last log entry (CASE_END) | LOG_INCOMPLETE | LOG_INCOMPLETE | OK |
+| T8b | Edit the recorded owner of a file in the manifest | MANIFEST_MODIFIED | MANIFEST_MODIFIED | OK |
 | T9a | Forge file + manifest + whole chain (plain chain, no anchor) | PASS | PASS | OK (known limitation) |
 | T9b | Same forgery, verified against the stored chain head | HEAD_MISMATCH | HEAD_MISMATCH | OK |
 | T9c | Same forgery on an HMAC keyed case (attacker has no key) | CHAIN_BREAK | CHAIN_BREAK | OK |
